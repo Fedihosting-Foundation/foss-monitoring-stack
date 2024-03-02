@@ -1,0 +1,281 @@
+---
+version: "3"
+
+networks:
+  lemmy-link:
+    name: lemmy_lemmyinternal
+    external: true
+  loki:
+
+volumes:
+    prometheus_data: {}
+    grafana_data: {}
+
+services:
+  read:
+    restart: on-failure
+    image: grafana/loki:2.8.2
+    command: "-config.file=/etc/loki/config.yaml -target=read"
+    ports:
+      - 127.0.0.1:3101:3100
+      - 127.0.0.1:7946:7946
+      - 127.0.0.1:9095:9095
+    volumes:
+      - ./loki/config.yaml:/etc/loki/config.yaml
+    depends_on:
+      - minio
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: &loki-dns
+      loki:
+        aliases:
+          - loki
+
+  write:
+    restart: on-failure
+    image: grafana/loki:2.8.2
+    command: "-config.file=/etc/loki/config.yaml -target=write"
+    ports:
+      - 127.0.0.1:3102:3100
+      - 127.0.0.1:7947:7946
+      - 127.0.0.1:9096:9095
+    volumes:
+      - ./loki/config.yaml:/etc/loki/config.yaml
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/ready || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - minio
+    networks:
+      <<: *loki-dns
+
+  promtail-docker:
+    restart: always
+    image: grafana/promtail:2.8.2
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yaml
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers:/var/lib/docker/containers
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - gateway
+    networks:
+      - loki
+
+  promtail-host:
+    restart: always
+    image: grafana/promtail:2.8.2
+    volumes:
+      - ./promtail/promtail-config-host.yaml:/etc/promtail/config.yaml
+      - /var/log/:/var/log:ro
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - gateway
+    networks:
+      - loki
+
+  minio:
+    restart: on-failure
+    image: minio/minio
+    entrypoint:
+      - sh
+      - -euc
+      - |
+        mkdir -p /data/loki-data && \
+        mkdir -p /data/loki-ruler && \
+        minio server --console-address ":9001" /data
+    environment:
+      - MINIO_ROOT_USER=loki
+      - MINIO_ROOT_PASSWORD=supersecret
+      - MINIO_PROMETHEUS_AUTH_TYPE=public
+      - MINIO_UPDATE=off
+    ports:
+      - 127.0.0.1:9009:9000
+      - "127.0.0.1:9001:9001"
+
+    volumes:
+      - ./.data/minio:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      interval: 15s
+      timeout: 20s
+      retries: 5
+    networks:
+      - loki
+
+  grafana:
+    restart: on-failure
+    image: grafana/grafana:latest
+    env_file:
+      - ./grafana/grafana.env
+    depends_on:
+      - gateway
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000" # If you change this to NOT localhost (ex add HTTPS), change the password in .env too
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - loki
+      - lemmy-link
+  gateway:
+    restart: on-failure
+    image: nginx:latest
+    depends_on:
+      - read
+      - write
+    entrypoint:
+      - sh
+      - -euc
+      - |
+        cat <<EOF > /etc/nginx/nginx.conf
+        user  nginx;
+        worker_processes  5;  ## Default: 1
+
+        events {
+          worker_connections   1000;
+        }
+
+        http {
+          resolver 127.0.0.11;
+
+          server {
+            listen             3100;
+
+            location = / {
+              return 200 'OK';
+              auth_basic off;
+            }
+
+            location = /api/prom/push {
+              proxy_pass       http://write:3100\$$request_uri;
+            }
+
+            location = /api/prom/tail {
+              proxy_pass       http://read:3100\$$request_uri;
+              proxy_set_header Upgrade \$$http_upgrade;
+              proxy_set_header Connection "upgrade";
+            }
+
+            location ~ /api/prom/.* {
+              proxy_pass       http://read:3100\$$request_uri;
+            }
+
+            location = /loki/api/v1/push {
+              proxy_pass       http://write:3100\$$request_uri;
+            }
+
+            location = /loki/api/v1/tail {
+              proxy_pass       http://read:3100\$$request_uri;
+              proxy_set_header Upgrade \$$http_upgrade;
+              proxy_set_header Connection "upgrade";
+            }
+
+            location ~ /loki/api/.* {
+              proxy_pass       http://read:3100\$$request_uri;
+            }
+          }
+        }
+        EOF
+        /docker-entrypoint.sh nginx -g "daemon off;"
+    ports:
+      - "127.0.0.1:3100:3100"
+    healthcheck:
+      test: ["CMD", "service", "nginx", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - loki
+
+  # flog: # Fake log gen for dev testing
+  #   image: mingrammer/flog
+  #   command: -f json -d 1s -l
+  #   networks:
+  #     - loki
+
+
+  nodeexporter:
+    image: prom/node-exporter:v1.3.1
+    # container_name: nodeexporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:9100 || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: always
+    expose:
+      - 9100
+    networks:
+      - loki
+    labels:
+      org.label-schema.group: "monitoring"
+
+  prometheus:
+    image: prom/prometheus:v2.38.0
+    # container_name: prometheus
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    restart: always
+    expose:
+      - 9090
+    networks:
+      - loki
+    labels:
+      org.label-schema.group: "monitoring"
+
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    privileged: true
+    restart: always
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    expose:
+      - 8080
+    networks:
+      - loki
+    devices:
+      - /dev/kmsg:/dev/kmsg
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    ports:
+      - 127.0.0.1:9187:9187
+    environment:
+      DATA_SOURCE_NAME: "postgresql://RO_DB_USER:RO_DB_PASS@lemmy_postgres_1:5432/lemmy?sslmode=disable"
+      # Lemmy DB User and Password go here
+    networks:
+      - loki
+      - lemmy-link
